@@ -29,9 +29,13 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdbool.h>
 
 #define _FILE_OFFSET_BITS 64
 #define MAX_STRING_LENGTH 1000
+#define TSIZE 1048576
+
+#define SEED 1159241
 
 typedef double real;
 
@@ -40,6 +44,112 @@ typedef struct cooccur_rec {
     int word2;
     real val;
 } CREC;
+
+typedef struct hashrec {
+    char        *word;
+    long long id;
+    struct hashrec *next;
+} HASHREC;
+
+typedef struct exclude_hashrec {
+    long long id1;
+    long long id2;
+    struct hashrec *next;
+} EHASHREC;
+
+/* Move-to-front hashing and hash function from Hugh Williams, http://www.seg.rmit.edu.au/code/zwh-ipl/ */
+
+/* Simple bitwise hash function */
+unsigned int bitwisehash(char *word, int tsize, unsigned int seed) {
+    char c;
+    unsigned int h;
+    h = seed;
+    for (; (c =* word) != '\0'; word++) h ^= ((h << 5) + c + (h >> 2));
+    return((unsigned int)((h&0x7fffffff) % tsize));
+}
+
+long long hash64(long long key) {
+    key >>= 3;
+    return (key ^ (key >> 10) ^ (key >> 20)) & 0x3FF;
+}
+long long hash64pair(long long id1, long long id2) {
+    return hash64(id1) ^ hash64(id2);
+}
+
+/* Create hash table, initialise pointers to NULL */
+HASHREC ** inithashtable() {
+    int i;
+    HASHREC **ht;
+    ht = (HASHREC **) malloc( sizeof(HASHREC *) * TSIZE );
+    for (i = 0; i < TSIZE; i++) ht[i] = (HASHREC *) NULL;
+    return(ht);
+}
+EHASHREC **initehashtable() {
+    int i;
+    EHASHREC **ht;
+    ht = (EHASHREC **) malloc(sizeof(EHASHREC *) * TSIZE);
+    for (i = 0; i < TSIZE; i++) ht[i] = (EHASHREC *) NULL;
+    return ht;
+}
+
+/* Search hash table for given string, return record if found, else NULL */
+HASHREC *hashsearch(HASHREC **ht, char *w) {
+    HASHREC     *htmp, *hprv;
+    unsigned int hval = bitwisehash(w, TSIZE, SEED);
+    for (hprv = NULL, htmp=ht[hval]; htmp != NULL && scmp(htmp->word, w) != 0; hprv = htmp, htmp = htmp->next);
+    if ( htmp != NULL && hprv!=NULL ) { // move to front on access
+        hprv->next = htmp->next;
+        htmp->next = ht[hval];
+        ht[hval] = htmp;
+    }
+    return(htmp);
+}
+EHASHREC *ehashsearch(EHASHREC **ht, long long id1, long long id2) {
+    EHASHREC     *htmp, *hprv;
+    long long hval = hash64pair(id1, id2);
+    for (hprv = NULL, htmp=ht[hval]; htmp != NULL && !(htmp->id1 == id1 && htmp->id2 == id2); hprv = htmp, htmp = htmp->next);
+    if ( htmp != NULL && hprv!=NULL ) { // move to front on access
+        hprv->next = htmp->next;
+        htmp->next = ht[hval];
+        ht[hval] = htmp;
+    }
+    return(htmp);
+}
+
+
+/* Insert string in hash table, check for duplicates which should be absent */
+void hashinsert(HASHREC **ht, char *w, long long id) {
+    HASHREC     *htmp, *hprv;
+    unsigned int hval = bitwisehash(w, TSIZE, SEED);
+    for (hprv = NULL, htmp = ht[hval]; htmp != NULL && scmp(htmp->word, w) != 0; hprv = htmp, htmp = htmp->next);
+    if (htmp == NULL) {
+        htmp = (HASHREC *) malloc(sizeof(HASHREC));
+        htmp->word = (char *) malloc(strlen(w) + 1);
+        strcpy(htmp->word, w);
+        htmp->id = id;
+        htmp->next = NULL;
+        if (hprv == NULL) ht[hval] = htmp;
+        else hprv->next = htmp;
+    }
+    else fprintf(stderr, "Error, duplicate entry located: %s.\n",htmp->word);
+    return;
+}
+void ehashinsert(EHASHREC **ht, long long id1, long long id2) {
+    EHASHREC     *htmp, *hprv;
+    unsigned int hval = hash64pair(id1, id2);
+    for (hprv = NULL, htmp = ht[hval]; htmp != NULL && !(htmp->id1 == id1 && htmp->id2 == id2); hprv = htmp, htmp = htmp->next);
+    if (htmp == NULL) {
+        htmp = (EHASHREC *) malloc(sizeof(EHASHREC));
+        htmp->id1 = id1;
+        htmp->id2 = id2;
+        htmp->next = NULL;
+        if (hprv == NULL) ht[hval] = htmp;
+        else hprv->next = htmp;
+    }
+    else fprintf(stderr, "Error, duplicate entry located: %lld, %lld.\n",htmp->id1, htmp->id2);
+    return;
+}
+
 
 int write_header=0; //0=no, 1=yes; writes vocab_size/vector_size as first line for use with some libraries, such as gensim.
 int verbose = 2; // 0, 1, or 2
@@ -56,6 +166,8 @@ real alpha = 0.75, x_max = 100.0; // Weighting function parameters, not extremel
 real *W, *gradsq, *cost;
 long long num_lines, *lines_per_thread, vocab_size;
 char *vocab_file, *input_file, *save_W_file, *save_gradsq_file;
+char *exclude_file;
+EHASHREC *ehtmp, **exclude_hash;
 
 /* Efficient string comparison */
 int scmp( char *s1, char *s2 ) {
@@ -110,18 +222,36 @@ void *glove_thread(void *vid) {
     fin = fopen(input_file, "rb");
     fseeko(fin, (num_lines / num_threads * id) * (sizeof(CREC)), SEEK_SET); //Threads spaced roughly equally throughout file
     cost[id] = 0;
-    
+
     real* W_updates1 = (real*)malloc(vector_size * sizeof(real));
     real* W_updates2 = (real*)malloc(vector_size * sizeof(real));
     for (a = 0; a < lines_per_thread[id]; a++) {
         fread(&cr, sizeof(CREC), 1, fin);
         if (feof(fin)) break;
         if (cr.word1 < 1 || cr.word2 < 1) { continue; }
-        
+
+        // Check exclude table.
+        if (exclude_hash != NULL) {
+            long long key1, key2;
+            if (cr.word1 < cr.word2) {
+                key1 = cr.word1;
+                key2 = cr.word2;
+            } else {
+                key1 = cr.word2;
+                key2 = cr.word1;
+            }
+            EHASHREC *htmp = ehashsearch(exclude_hash, key1, key2);
+            if (htmp != NULL) {
+                // Exclude.
+                fprintf(stderr, "Excluding %lld, %lld\n", key1, key2);
+                continue;
+            }
+        }
+
         /* Get location of words in W & gradsq */
         l1 = (cr.word1 - 1LL) * (vector_size + 1); // cr word indices start at 1
         l2 = ((cr.word2 - 1LL) + vocab_size) * (vector_size + 1); // shift by vocab_size to get separate vectors for context words
-        
+
         /* Calculate cost, save diff for gradients */
         diff = 0;
         for (b = 0; b < vector_size; b++) diff += W[b + l1] * W[b + l2]; // dot product of word and context word vector
@@ -135,7 +265,7 @@ void *glove_thread(void *vid) {
         }
 
         cost[id] += 0.5 * fdiff * diff; // weighted squared error
-        
+
         /* Adaptive gradient updates */
         fdiff *= eta; // for ease in calculating gradient
         real W_updates1_sum = 0;
@@ -165,11 +295,11 @@ void *glove_thread(void *vid) {
         fdiff *= fdiff;
         gradsq[vector_size + l1] += fdiff;
         gradsq[vector_size + l2] += fdiff;
-        
+
     }
     free(W_updates1);
     free(W_updates2);
-    
+
     fclose(fin);
     pthread_exit(NULL);
 }
@@ -187,7 +317,7 @@ int save_params(int nb_iter) {
     char output_file[MAX_STRING_LENGTH], output_file_gsq[MAX_STRING_LENGTH];
     char *word = malloc(sizeof(char) * MAX_STRING_LENGTH + 1);
     FILE *fid, *fout, *fgs;
-    
+
     if (use_binary > 0) { // Save parameters in binary file
         if (nb_iter <= 0)
             sprintf(output_file,"%s.bin",save_W_file);
@@ -298,7 +428,7 @@ int train_glove() {
     real total_cost = 0;
 
     fprintf(stderr, "TRAINING MODEL\n");
-    
+
     fin = fopen(input_file, "rb");
     if (fin == NULL) {fprintf(stderr,"Unable to open cooccurrence file %s.\n",input_file); return 1;}
     fseeko(fin, 0, SEEK_END);
@@ -315,7 +445,7 @@ int train_glove() {
     if (verbose > 0) fprintf(stderr,"alpha: %lf\n", alpha);
     pthread_t *pt = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     lines_per_thread = (long long *) malloc(num_threads * sizeof(long long));
-    
+
     time_t rawtime;
     struct tm *info;
     char time_buffer[80];
@@ -371,8 +501,9 @@ int main(int argc, char **argv) {
     input_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
     save_W_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
     save_gradsq_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
+    exclude_file = malloc(sizeof(char) * MAX_STRING_LENGTH);
     int result = 0;
-    
+
     if (argc == 1) {
         printf("GloVe: Global Vectors for Word Representation, v0.2\n");
         printf("Author: Jeffrey Pennington (jpennin@stanford.edu)\n\n");
@@ -429,8 +560,11 @@ int main(int argc, char **argv) {
         if ((i = find_arg((char *)"-model", argc, argv)) > 0) model = atoi(argv[i + 1]);
         if (model != 0 && model != 1) model = 2;
         if ((i = find_arg((char *)"-save-gradsq", argc, argv)) > 0) save_gradsq = atoi(argv[i + 1]);
-        if ((i = find_arg((char *)"-vocab-file", argc, argv)) > 0) strcpy(vocab_file, argv[i + 1]);
-        else strcpy(vocab_file, (char *)"vocab.txt");
+
+        if ((i = find_arg((char *)"-vocab-file", argc, argv)) > 0) {
+            strcpy(vocab_file, argv[i + 1]);
+        } else strcpy(vocab_file, (char *)"vocab.txt");
+
         if ((i = find_arg((char *)"-save-file", argc, argv)) > 0) strcpy(save_W_file, argv[i + 1]);
         else strcpy(save_W_file, (char *)"vectors");
         if ((i = find_arg((char *)"-gradsq-file", argc, argv)) > 0) {
@@ -441,7 +575,66 @@ int main(int argc, char **argv) {
         if ((i = find_arg((char *)"-input-file", argc, argv)) > 0) strcpy(input_file, argv[i + 1]);
         else strcpy(input_file, (char *)"cooccurrence.shuf.bin");
         if ((i = find_arg((char *)"-checkpoint-every", argc, argv)) > 0) checkpoint_every = atoi(argv[i + 1]);
-        
+
+        if ((i = find_arg((char *)"-exclude-file", argc, argv)) > 0) {
+            /**
+             * Load skip-gram exclusions from file. We first need to load the
+             * vocab file as well in order to retrieve the relevant word IDs.
+             */
+            FILE *vocab_fid, *exclude_fid;
+            long long j = 0, id, vocab_size;
+            char format[20], str[MAX_STRING_LENGTH + 1];
+            char word1[MAX_STRING_LENGTH + 1], word2[MAX_STRING_LENGTH + 1];
+            HASHREC *htmp, **vocab_hash = inithashtable();
+
+            sprintf(format, "%%%ds %%lld", MAX_STRING_LENGTH); // Format to read from vocab file
+            vocab_fid = fopen(vocab_file, "r");
+            if (vocab_fid == NULL) {fprintf(stderr, "Unable to open vocab file %s.\n", vocab_file); return 1;}
+            while (fscanf(vocab_fid, format, str, &id) != EOF)
+                hashinsert(vocab_hash, str, ++j);
+            fclose(vocab_fid);
+            vocab_size = j;
+
+            fprintf(stderr, "loaded %lld words in vocab\n", vocab_size);
+
+            exclude_hash = initehashtable();
+            sprintf(format, "%%%ds %%%ds", MAX_STRING_LENGTH, MAX_STRING_LENGTH); // Format to read from exclude file
+            exclude_fid = fopen(argv[i + 1], "r");
+            if (exclude_fid == NULL) {fprintf(stderr, "Unable to open exclude file %s.\n", exclude_fid); return 1;}
+            int exclude_count = 0;
+            while (fscanf(exclude_fid, format, word1, word2) != EOF) {
+                long long id1, id2, temp;
+
+                // Retrieve IDs of two words
+                fprintf(stderr, "Searching '%s' and '%s'\n", word1, word2);
+                htmp = hashsearch(vocab_hash, word1);
+                if (htmp == NULL) {
+                    fprintf(stderr, "Exclude table setup: Could not find %s in vocabulary\n", word1);
+                    continue;
+                }
+                id1 = htmp->id;
+
+                htmp = hashsearch(vocab_hash, word2);
+                if (htmp == NULL) {
+                    fprintf(stderr, "Exclude table setup: Could not find %s in vocaublary\n", word2);
+                    continue;
+                }
+                id2 = htmp->id;
+
+                // Ensure id1 < id2.
+                if (id1 > id2) {
+                    temp = id1;
+                    id1 = id2;
+                    id2 = temp;
+                }
+
+                ehashinsert(exclude_hash, id1, id2);
+                exclude_count++;
+            }
+
+            fprintf("Added %i entries to exclude table.", exclude_count);
+        }
+
         vocab_size = 0;
         fid = fopen(vocab_file, "r");
         if (fid == NULL) {fprintf(stderr, "Unable to open vocab file %s.\n",vocab_file); return 1;}
@@ -455,5 +648,6 @@ int main(int argc, char **argv) {
     free(input_file);
     free(save_W_file);
     free(save_gradsq_file);
+    free(exclude_file);
     return result;
 }
