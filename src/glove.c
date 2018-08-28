@@ -606,7 +606,6 @@ int main(int argc, char **argv) {
                 long long id1, id2, temp;
 
                 // Retrieve IDs of two words
-                fprintf(stderr, "Searching '%s' and '%s'\n", word1, word2);
                 htmp = hashsearch(vocab_hash, word1);
                 if (htmp == NULL) {
                     fprintf(stderr, "Exclude table setup: Could not find %s in vocabulary\n", word1);
@@ -632,7 +631,7 @@ int main(int argc, char **argv) {
                 exclude_count++;
             }
 
-            fprintf("Added %i entries to exclude table.", exclude_count);
+            fprintf(stderr, "Added %i entries to exclude table.", exclude_count);
         }
 
         vocab_size = 0;
